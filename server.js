@@ -1,7 +1,7 @@
 require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
-const OpenAI = require('openai');
+const { GoogleGenerativeAI, HarmCategory, HarmBlockThreshold } = require('@google/generative-ai');
 const nodemailer = require('nodemailer');
 
 const app = express();
@@ -12,10 +12,8 @@ app.use(cors());
 app.use(express.json());
 app.use(express.static('public'));
 
-// Initialize OpenAI
-const openai = new OpenAI({
-    apiKey: process.env.OPENAI_API_KEY
-});
+// Initialize Google Generative AI
+const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 
 // DEBUG: Check if email credentials are loaded
 console.log('DEBUG: EMAIL_USER from env:', process.env.EMAIL_USER);
@@ -76,29 +74,78 @@ General Guidelines:
 -   Use the conversation history (user's previous messages) to understand what has already been provided.
 `;
 
+// Define the JSON schema for customer details (tool for Gemini)
+const customerDetailsSchema = {
+    type: "OBJECT", // Changed from "object" to "OBJECT" for Gemini
+    properties: {
+        name: { type: "STRING", description: "Customer's full name as stated in the conversation." }, // Changed "string" to "STRING"
+        email: { type: "STRING", description: "Customer's email address as stated in the conversation." }, // Changed "string" to "STRING"
+        phone: { type: "STRING", description: "Customer's phone number as stated in the conversation." }, // Changed "string" to "STRING"
+        company: { type: "STRING", description: "Customer's company name (optional). If not mentioned, this can be omitted or explicitly stated as 'Not provided'." }, // Changed "string" to "STRING"
+        service: { type: "STRING", description: "The IT service the customer is interested in (e.g., Cloud Solutions, Cybersecurity, Network Setup, Software Development, IT Consulting) as identified from the conversation." }, // Changed "string" to "STRING"
+        requirements: { type: "STRING", description: "A brief description of the customer's specific requirements for the chosen IT service, as stated in the conversation." } // Changed "string" to "STRING"
+    },
+    required: ["name", "email", "phone", "service", "requirements"]
+};
+
+const tools = [
+  {
+    functionDeclarations: [
+      {
+        name: "extract_customer_details",
+        description: "Extracts customer contact information, service interest, and requirements from the provided conversation history.",
+        parameters: customerDetailsSchema,
+      },
+    ],
+  },
+];
+
 // API endpoint for chat
 app.post('/api/chat', async (req, res) => {
     try {
-        const { messages } = req.body;
+        const { messages } = req.body; // messages should be an array of {role: "user" or "model", parts: [{text: "message content"}]}
 
-        const completion = await openai.chat.completions.create({
-            model: "gpt-4o-mini",
-            messages: [
-                { role: "system", content: systemPrompt },
-                ...messages
-            ],
-            max_tokens: 150,
-            temperature: 0.7,
+        const model = genAI.getGenerativeModel({ 
+            model: "gemini-2.0-flash-lite",
+            systemInstruction: systemPrompt,
         });
 
-        res.json({ message: completion.choices[0].message.content });
+        const chat = model.startChat({
+            history: messages.slice(0, -1).map(msg => ({ // Exclude the last message for the current turn
+                role: msg.role === 'assistant' ? 'model' : msg.role, // map assistant to model
+                parts: [{ text: msg.content || (msg.parts && msg.parts[0] && msg.parts[0].text) || "" }]
+            })),
+            generationConfig: {
+                maxOutputTokens: 150,
+                temperature: 0.7,
+            },
+             safetySettings: [
+                { category: HarmCategory.HARM_CATEGORY_HARASSMENT, threshold: HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE },
+                { category: HarmCategory.HARM_CATEGORY_HATE_SPEECH, threshold: HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE },
+                { category: HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT, threshold: HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE },
+                { category: HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT, threshold: HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE },
+            ]
+        });
+        
+        const lastMessage = messages[messages.length - 1];
+        const userMessageContent = lastMessage.content || (lastMessage.parts && lastMessage.parts[0] && lastMessage.parts[0].text) || "";
+
+        const result = await chat.sendMessage(userMessageContent);
+        const response = result.response;
+        const text = response.text();
+        
+        res.json({ message: text });
+
     } catch (error) {
-        console.error('Error:', error);
-        res.status(500).json({ error: 'An error occurred while processing your request' });
+        console.error('Error in /api/chat:', error.message);
+        if (error.response) {
+            console.error('Error details:', error.response.promptFeedback);
+        }
+        res.status(500).json({ error: 'An error occurred while processing your request', details: error.message });
     }
 });
 
-// API endpoint for sending email notifications (Reverted to Chat Completions with Tool Call)
+// API endpoint for sending email notifications
 app.post('/api/send-inquiry', async (req, res) => {
     try {
         const { userDetails: initialUserDetails, conversation } = req.body; 
@@ -106,61 +153,72 @@ app.post('/api/send-inquiry', async (req, res) => {
         if (!conversation || conversation.length === 0) {
             return res.status(400).json({ error: "Conversation history is required for detail extraction." });
         }
-
-        // Define the tool for extracting customer details directly in the route
-        const customerDetailsTool = {
-            type: "function",
-            function: {
-                name: "extract_customer_details",
-                description: "Extracts customer contact information, service interest, and requirements from the provided conversation history.",
-                parameters: {
-                    type: "object",
-                    properties: {
-                        name: { type: "string", description: "Customer's full name as stated in the conversation." },
-                        email: { type: "string", description: "Customer's email address as stated in the conversation." },
-                        phone: { type: "string", description: "Customer's phone number as stated in the conversation." },
-                        company: { type: "string", description: "Customer's company name (optional). If not mentioned, this can be omitted or explicitly stated as 'Not provided'." },
-                        service: { type: "string", description: "The IT service the customer is interested in (e.g., Cloud Solutions, Cybersecurity, Network Setup, Software Development, IT Consulting) as identified from the conversation." },
-                        requirements: { type: "string", description: "A brief description of the customer's specific requirements for the chosen IT service, as stated in the conversation." }
-                    },
-                    required: ["name", "email", "phone", "service", "requirements"]
-                }
-            }
-        };
-
-        const extractionSystemPrompt = "You are an expert data extraction assistant. Your task is to analyze the following conversation between an IT services chatbot and a user. Extract the user's full name, email address, phone number, company name (if provided), the IT service they are interested in, and their specific requirements. Use the 'extract_customer_details' function tool to return this information. If the user did not provide a company name, you can indicate 'Not provided' for the company field. Ensure all other required fields are accurately filled based on the conversation.";
         
-        const extractionMessages = [
-            { role: "system", content: extractionSystemPrompt },
-            ...conversation.map(msg => ({ 
-                role: msg.role, 
-                content: typeof msg.content === 'string' ? msg.content : JSON.stringify(msg.content)
-            })),
-            { role: "user", content: "Based on the conversation above, please extract the customer details using the function call." }
+        const model = genAI.getGenerativeModel({
+            model: "gemini-2.0-flash-lite", // Using Gemini for extraction as well
+            tools: tools
+        });
+
+        const extractionSystemPrompt = "You are an expert data extraction assistant. Your task is to analyze the following conversation between an IT services chatbot and a user. Extract the user's full name, email address, phone number, company name (if provided), the IT service they are interested in, and their specific requirements. Use the 'extract_customer_details' function tool to return this information. If the user did not provide a company name, you can indicate 'Not provided' for the company field. Ensure all other required fields are accurately filled based on the conversation. The conversation is provided below.";
+
+        // Convert conversation to Gemini format
+        const geminiConversationHistory = [
+            { role: "user", parts: [{ text: extractionSystemPrompt }] },
+            { role: "model", parts: [{ text: "Okay, I understand. Please provide the conversation."}] } // Priming message
         ];
-        
-        let extractedDataFromAI;
-        try {
-            const extractionCompletion = await openai.chat.completions.create({
-                model: "gpt-4o-2024-08-06", 
-                messages: extractionMessages,
-                tools: [customerDetailsTool],
-                tool_choice: { type: "function", function: { name: "extract_customer_details" } } 
-            });
 
-            const toolCall = extractionCompletion.choices[0].message.tool_calls?.[0];
-            if (toolCall && toolCall.function.name === "extract_customer_details") {
-                extractedDataFromAI = JSON.parse(toolCall.function.arguments);
-            } else {
-                console.error("OpenAI did not call the expected function for detail extraction. Tool call:", toolCall);
-                throw new Error("Failed to extract details using OpenAI. The expected function was not called.");
-            }
-        } catch (extractionError) {
-            console.error("Error during OpenAI Chat Completions detail extraction:", extractionError);
-            return res.status(500).json({
-                error: "Failed to extract user details from conversation via Chat Completions.",
-                detail: extractionError.message
+        conversation.forEach(msg => {
+            geminiConversationHistory.push({
+                role: msg.role === 'assistant' ? 'model' : msg.role,
+                parts: [{ text: msg.content || (msg.parts && msg.parts[0] && msg.parts[0].text) || "" }]
             });
+        });
+         geminiConversationHistory.push( { role: "user", parts: [{text: "Based on the conversation above, please extract the customer details using the function call."}]});
+
+
+        const chat = model.startChat({
+            history: geminiConversationHistory,
+            generationConfig: {
+                temperature: 0.2, // Lower temperature for more deterministic extraction
+            },
+            safetySettings: [
+                { category: HarmCategory.HARM_CATEGORY_HARASSMENT, threshold: HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE },
+                { category: HarmCategory.HARM_CATEGORY_HATE_SPEECH, threshold: HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE },
+                { category: HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT, threshold: HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE },
+                { category: HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT, threshold: HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE },
+            ]
+        });
+
+        const result = await chat.sendMessage("Extract the details."); // Send a final message to trigger tool use.
+
+        let extractedDataFromAI = {};
+        const functionCalls = result.response.functionCalls();
+
+        if (functionCalls && functionCalls.length > 0 && functionCalls[0].name === 'extract_customer_details') {
+             extractedDataFromAI = functionCalls[0].args;
+        } else {
+            console.error("Gemini did not call the expected function for detail extraction. Response:", JSON.stringify(result.response, null, 2));
+            // Fallback or error handling if Gemini doesn't make the function call
+            // For now, we'll try to parse the text content if available, though this is less reliable
+            const textContent = result.response.text();
+            if (textContent) {
+                try {
+                    // This is a very brittle fallback. Ideally, the function call should work.
+                    // We are assuming the text might contain a JSON-like string.
+                    const potentialJson = textContent.substring(textContent.indexOf('{'), textContent.lastIndexOf('}') + 1);
+                    if (potentialJson) {
+                        extractedDataFromAI = JSON.parse(potentialJson);
+                        console.warn("Warning: Gemini did not use function calling. Parsed details from text response as a fallback:", extractedDataFromAI);
+                    } else {
+                         throw new Error("No function call and no parsable JSON in text response.");
+                    }
+                } catch (parseError) {
+                     console.error("Error parsing text content as JSON fallback:", parseError);
+                     throw new Error("Failed to extract details using Gemini. The expected function was not called, and fallback parsing failed.");
+                }
+            } else {
+                 throw new Error("Failed to extract details using Gemini. The expected function was not called, and no text response was available for fallback.");
+            }
         }
         
         const finalUserDetails = {
@@ -254,12 +312,12 @@ app.post('/api/send-inquiry', async (req, res) => {
         }
 
     } catch (error) {
-        console.error('General error in /api/send-inquiry (Chat Completions):', error.message);
+        console.error('General error in /api/send-inquiry (Gemini):', error.message);
         if (error.code === 'EAUTH' || error.command === 'AUTH' || error.responseCode === 535) {
             console.error('Nodemailer authentication error: Check EMAIL_USER and EMAIL_PASS in .env.');
             return res.status(500).json({ error: 'Email server authentication failed. Please contact support.' });
-        } else if (error.message && (error.message.includes("OpenAI") || error.type === 'invalid_request_error')) {
-             return res.status(500).json({ error: 'Failed to process inquiry due to an issue with the AI service.', detail: error.message });
+        } else if (error.message && (error.message.includes("Gemini") || error.type === 'invalid_request_error')) {
+             return res.status(500).json({ error: 'Failed to process inquiry due to an issue with the Gemini service.', detail: error.message });
         } else {
             return res.status(500).json({ error: 'Failed to process inquiry and send email notifications due to an unexpected server error.' });
         }
